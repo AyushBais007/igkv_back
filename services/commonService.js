@@ -327,7 +327,7 @@ var common = {
         let validParam = true;
         let p = [], err_obj = {};
         if (!(params.query_id && typeof params.query_id == "number")) {
-            return callback({ ...SECURITY_SERVICE.SECURITY_ERRORS.MANDATORY_FIELDS_ARE_MISSING, message: `query id is required and its type must be string.` });
+            return callback({ ...SECURITY_SERVICE.SECURITY_ERRORS.MANDATORY_FIELDS_ARE_MISSING, message: `query id is required and its type must be number.` });
         }
         const { access_type = "S" } = params;
         let table_name = 'mas_custom_queries'
