@@ -382,6 +382,27 @@ var getInsertClauseWithParams = function (obj, tablename) {
 
     return { query: query, params: params };
 }
+var getInsertWithUpdateClauseWithParams = function (obj,updateObj, tablename) {
+    const params = [];
+    const keys = Object.keys(obj);
+    const values = Object.values(obj);
+
+    const columnList = keys.join(', ');
+    const parameterList = keys.map((_, idx) => `$${idx + 1}`).join(', ');
+
+    // Build ON DUPLICATE KEY UPDATE part
+    const updateList = Object.keys(updateObj)
+        .map((key, idx) => `${key} = VALUES(${key})`) // EXCLUDED is PostgreSQL style
+        .join(', ');
+
+    const query = `
+        INSERT INTO ${tablename} (${columnList})
+        VALUES (${parameterList})
+       ON DUPLICATE KEY UPDATE ${updateList};
+    `.trim();
+    return { query, params: values };
+};
+module.exports.getInsertWithUpdateClauseWithParams = getInsertWithUpdateClauseWithParams;
 
 var getInsertClauseValuesOnlyWithParams = function (obj, tablename) {
     // console.log('getInsertClauseValuesOnlyWithParams');
@@ -722,13 +743,12 @@ var gettimehandle = function (log1, log2) {
 
 }
 
-
 var cleartimehandle = function (starttime, log1, log2) {
     var dt = (new Date()).getTime();
     var secondstowait = 0;
     var difftime = parseInt((dt - starttime) / 1000);
     if (difftime > secondstowait) {
-        getConnection(CONFIG_PARAMS.getUfpDBDetails(), function (error, client, done) {
+        getConnection(CONFIG_PARAMS.getCommonDBDetails(), function (error, client, done) {
             if (log2 && log2.length > 0) {
                 for (var i = 0; i < log2.length; i++) {
                     log1 = log1.replace("?", log2[i]);
@@ -743,3 +763,159 @@ var cleartimehandle = function (starttime, log1, log2) {
         })
     }
 }
+
+module.exports.getQueryDataFromId = function (dbkey, request, params, sessionDetails, callback) {
+    let queryObj = {}
+    async.series([
+        function (cback) {
+            getQueryFromID(dbkey, params, sessionDetails, function (err, qAndP) {
+                if (err) return cback(err);
+                else if (qAndP) {
+                    queryObj = qAndP;
+                   // console.log(qAndP);
+                    
+                    return cback();
+                } else {
+                    return cback({ message: `no query object recived from getQueryFromID function.` })
+                }
+            });
+        },
+        function (cback1) {
+            executeQueryWithParameters(queryObj.dbkey, queryObj.query, queryObj.params, function (e1, r1) {
+                if (e1) {
+                    return cback1(e1);
+                }
+                else if (r1 && r1.data) {
+                    found_rows = r1.data;
+                    return cback1(null);
+                }
+            })
+        }
+    ], function (err, res) {
+        if (err) {
+            return callback(err)
+        } else {
+            return callback(null, found_rows)
+        }
+
+    })
+};
+
+let getQueryFromID = function (dbkey, params, sessionDetails, callback) {
+    dbkey = CONFIG_PARAMS.getCommonDBDetails();
+    let validParam = true;
+    let p = [], err_obj = {};
+    if (!(sessionDetails.query_id && typeof sessionDetails.query_id == "number")) {
+        return callback({ message: `query id is required and its type must be number.` });
+    }
+    const { access_type = "A" } = sessionDetails;
+    let table_name = 'mas_custom_queries'
+    let query = `SELECT * FROM ${table_name} mq WHERE mq.query_id = ${sessionDetails.query_id}`
+    DB_SERVICE.executeQueryWithParameters(dbkey, query, [], (e1, r1) => {
+        if (e1) {
+            return callback(e1);
+        } else if (r1.data && r1.data.length == 1) {
+            // console.log(r1.data[0]['query_object']);
+            let all_query_details = JSON.parse(r1.data[0]['query_object'])
+            if (!(all_query_details["permission"][access_type] || access_type == 'A')) return callback({ message: `no  record found in mas_queries for access_type ${access_type} query_name ${all_query_details.query_name}}` });
+            Object.keys(params).forEach((key) => {
+                if (params[key] === null || params[key] == ""|| params[key] === 'null' || params[key] === undefined || params[key] == -1) {
+                    delete params[key];
+                }
+            })
+            
+            
+            let excuteQueryDbkey = global.COMMON_CONFS.map_dbkey_database[r1.data[0].base_database];
+            if (excuteQueryDbkey == undefined) { return callback({ message: `no dbkey found for base_database ${r1.data[0].base_database}}` }); }
+            params['other'] = Object.keys(params);
+           // console.log( params['other'],params);
+            //delete params['other']['dbkey']
+            if (access_type === "C" && Array.isArray(sessionDetails.custom_value)) {
+                for (const element of sessionDetails.custom_value) {
+                    const keys = Object.keys(element).filter(key => typeof element[key] !== "object");
+                    const customKeys = Object.keys(element).filter(key => typeof element[key] === "object");
+                    if (customKeys.length !== 1) {
+                        return callback({ message: "Object must have exactly one key of type 'object'" });
+                    }
+
+                    if (keys.every(key => params[key] == element[key])) {
+                        Object.assign(params, element);
+                        break;
+                    } else {
+                        params[customKeys[0]] = null;
+                    }
+                }
+            }
+            //console.log(params);
+            let qAnpPObj = buildQuery(all_query_details, access_type, params['other']);
+           // console.log(qAnpPObj,access_type);
+
+            if ((qAnpPObj.params == [])) return callback(null, { query: qAnpPObj.query, params: [] });
+            for (let i = 0; i < qAnpPObj.params.length; i++) {
+                let key = qAnpPObj.params[i];
+                if (key in params) {
+                    p.push(params[key]);
+                    validParam = true
+                } else if (access_type == 'S' && key in sessionDetails) {
+                    p.push(sessionDetails[key]);
+                    validParam = true
+                }
+                else {
+                    err_obj = { message: `key ${key} not exists in given data.` }
+                    validParam = false;
+                    break;
+                }
+            }
+            //console.log(qAnpPObj.query, p);
+
+            if (validParam) {
+                return callback(null, { query: qAnpPObj.query, params: p, dbkey: excuteQueryDbkey });
+            }
+            else {
+                return callback(err_obj);
+            }
+        } else {
+            return callback({ message: `no or multiple record found in mas_queries for query_name ${params.query_name}}` })
+        }
+
+    })
+}
+module.exports.getQueryFromID = getQueryFromID
+
+
+function buildQuery(data, permission, params) {
+    let query = data.base;
+
+    // Use Set for join to ensure uniqueness
+    let join_arr = new Set(),
+        select_arr = [],
+        group_by_arr = [],
+        where_arr = [],
+        params_arr = [...data.params];
+
+    const mergeClauses = (obj) => {
+        if (!obj) return;
+        obj.join && obj.join.forEach(join_arr.add, join_arr);
+        obj.select && select_arr.push(obj.select);
+        obj.group && group_by_arr.push(obj.group);
+        obj.where && where_arr.push(obj.where);
+        obj.params && params_arr.push(...obj.params);
+    };
+
+    mergeClauses(data.permission[permission]);
+
+    if (params?.length) {
+        params.forEach(param => mergeClauses(data.other[param]));
+    }
+
+
+    // Construct query by replacing placeholders
+    query = query
+        .replace("$join", join_arr.size ? [...join_arr].join(" ") : "")
+        .replace("$select", select_arr.length ? ", " + select_arr.join(", ") : "")
+        .replace("$where", where_arr.length ? (query.includes("WHERE") || query.includes(" where")   ? " AND " : " WHERE ") + where_arr.join(" AND ") : "")
+        .replace("$group", group_by_arr.length ? (query.includes("GROUP BY") ? group_by_arr.join(", ") : "GROUP BY " + group_by_arr.join(", ")) : "");
+
+    return { query: query.trim(), params: params_arr };
+}
+module.exports.buildQuery = buildQuery
